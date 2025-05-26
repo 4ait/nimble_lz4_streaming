@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "nimblelz4"
-version = "0.1.0"
+version = "0.1.999"
 dependencies = [
  "lz4_flex",
  "rustler",
