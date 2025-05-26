@@ -1,9 +1,21 @@
 extern crate lz4_flex;
 extern crate rustler;
 
+use std::fs;
+use std::fs::File;
+use std::path::Path;
+use std::sync::Mutex;
 use rustler::types::atom;
 use rustler::types::binary::{Binary, OwnedBinary};
-use rustler::{Encoder, Env, Error, Term};
+use rustler::{Encoder, Env, Error, Resource, ResourceArc, Term};
+
+// Resource wrapper for the frame compressor
+struct FrameCompressorResource {
+    encoder: Mutex<Option<lz4_flex::frame::FrameEncoder<File>>>,
+}
+
+impl Resource for FrameCompressorResource {}
+
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn compress<'a>(env: Env<'a>, iolist_to_compress: Term<'a>) -> Result<Term<'a>, Error> {
@@ -73,12 +85,73 @@ fn decompress_frame<'a>(env: Env<'a>, binary_to_decompress: Binary) -> Result<Te
     }
 }
 
-fn load(_: Env, _: Term) -> bool {
-    true
+// New NIF functions for resource-based frame compression
+#[rustler::nif]
+fn create_frame_compressor_with_file_output<'a>(
+    env: Env<'a>,
+    output_path: &str,
+) -> Result<Term<'a>, Error> {
+    // Remove file if it exists
+    if Path::new(output_path).exists() {
+        if let Err(e) = fs::remove_file(output_path) {
+            return Ok((atom::error(), format!("Failed to remove existing file: {}", e)).encode(env));
+        }
+    }
+
+    // Create new file
+    match File::create_new(output_path) {
+        Ok(output) => {
+            let encoder = lz4_flex::frame::FrameEncoder::new(output);
+            let resource = ResourceArc::new(FrameCompressorResource {
+                encoder: Mutex::new(Some(encoder)),
+            });
+            Ok((atom::ok(), resource).encode(env))
+        }
+        Err(e) => Ok((atom::error(), format!("Failed to create file: {}", e)).encode(env)),
+    }
+}
+
+#[rustler::nif]
+fn write_to_frame<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FrameCompressorResource>,
+    chunk: Binary,
+) -> Result<Term<'a>, Error> {
+    let mut encoder_guard = resource.encoder.lock().unwrap();
+
+    if let Some(ref mut encoder) = encoder_guard.as_mut() {
+        match std::io::Write::write(encoder, chunk.as_slice()) {
+            Ok(_) => Ok(atom::ok().encode(env)),
+            Err(e) => Ok((atom::error(), format!("Write failed: {}", e)).encode(env)),
+        }
+    } else {
+        Ok((atom::error(), "Compressor already finished or not initialized").encode(env))
+    }
+}
+
+#[rustler::nif]
+fn finish_frame<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FrameCompressorResource>,
+) -> Result<Term<'a>, Error> {
+    let mut encoder_guard = resource.encoder.lock().unwrap();
+
+    if let Some(encoder) = encoder_guard.take() {
+        match encoder.finish() {
+            Ok(_) => Ok(atom::ok().encode(env)),
+            Err(e) => Ok((atom::error(), format!("Finish failed: {}", e)).encode(env)),
+        }
+    } else {
+        Ok((atom::error(), "Compressor already finished or not initialized").encode(env))
+    }
+}
+
+fn load(env: Env, _: Term) -> bool {
+    env.register::<FrameCompressorResource>().is_ok()
 }
 
 rustler::init!(
     "Elixir.NimbleLZ4",
-    [compress, compress_frame, decompress, decompress_frame],
-    load = load
+    load = load,
+    on_load = on_load
 );
